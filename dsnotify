@@ -1,0 +1,627 @@
+#!/usr/bin/python
+#
+# DSNotify - Trigger custom actions on Download Station task completion
+#
+# Copyright (c) 2016 Jeroen Koekkoek
+
+import argparse
+import asyncore
+import errno
+import httplib
+import json
+import logging
+import logging.handlers
+import os
+import re
+import smtpd
+import subprocess
+import sys
+import threading
+import urllib
+
+
+class downloadstation(object): # serves as namespace
+
+  class BadStatus(httplib.HTTPException):
+    def __init__(self, status_code):
+      self.status_code = int(status_code)
+      response = httplib.responses.get(status_code)
+      super(BadStatusCode,self).__init__(response)
+
+
+  class APIError(Exception):
+    def __init__(self, code, message):
+      self.code = code
+      super(downloadstation.APIError,self).__init__(message)
+
+
+  errors = {
+    100: 'Unkown parameter',
+    101: 'Invalid parameter',
+    102: 'The requested API does not exist',
+    103: 'The requested method does not exist',
+    104: 'The requested version does not support the functionality',
+    105: 'The logged in session does not have permission',
+    106: 'Session timeout',
+    107: 'Session interrupted by duplicate login',
+    400: 'No such account or incorrect password',
+    401: 'Account disabled',
+    402: 'Permission denied',
+    403: '2-step verification code required',
+    404: 'Failed to authenticate 2-step verification code'
+  }
+
+
+  @staticmethod
+  def error_factory(code):
+    message = 'Unkown error'
+    if code in downloadstation.errors:
+      message = downloadstation.errors[code]
+
+    return downloadstation.APIError(code, message)
+
+
+  class Task(object):
+
+    def __init__(self, title, destination):
+      self.title = title
+      self.destination = destination
+
+
+  class DownloadStation(object):
+
+    _sid = None
+
+    # reconnect if httplib exceptions occur due to overlong retry interval
+    _reconnect_on = (httplib.NotConnected,
+                     httplib.IncompleteRead,
+                     httplib.ImproperConnectionState,
+                     httplib.CannotSendRequest,
+                     httplib.CannotSendHeader,
+                     httplib.BadStatusLine)
+
+    def __init__(self, **kwargs):
+      assert all (x in kwargs for x in ('host','port','username','password'))
+
+      host = kwargs['host']
+      port = kwargs['port']
+      timeout = kwargs.get('timeout')
+
+      if kwargs.get('use_https', False):
+        self._connection = httplib.HTTPSConnection(host, port, timeout=timeout)
+      else:
+        self._connection = httplib.HTTPConnection(host, port, timeout=timeout)
+
+      self._username = kwargs['username']
+      self._password = kwargs['password']
+
+
+    def make_query(self, getvars):
+      query = ''
+      for key,val in getvars.iteritems():
+        if query == '':
+          sep = '?'
+        else:
+          sep = '&'
+        query = query + sep + key + '=' + str(val)
+      return query
+    # make_query
+
+
+    def login(self):
+      """Login to Download Station api."""
+
+      getvars = {
+        'api': 'SYNO.API.Auth',
+        'version': '2',
+        'method': 'login',
+        'account': self._username,
+        'passwd': self._password,
+        'session': 'DownloadStation',
+        'format': 'sid'
+      }
+
+      query = self.make_query(getvars)
+
+      for retry in range(2):
+        try:
+          self._connection.request('GET', '/webapi/auth.cgi' + query)
+          response = self._connection.getresponse()
+          if response.status == 200:
+            data = json.loads(response.read())
+            if data['success']:
+              self._sid = data['data']['sid']
+            else:
+              self._sid = None
+              raise downloadstation.error_factory(data['error']['code'])
+          else:
+            self._sid = None
+            raise downloadstation.BadStatus(response.status)
+        except self._reconnect_on:
+          if retry:
+            raise
+          self._connection.close()
+          self._connection.connect()
+          continue
+
+        break # exit for-loop on success
+      # for
+
+      return self._sid
+    # login
+
+
+    def logout(self):
+      """Logout of Download Station api"""
+      getvars = {
+        'api': 'SYNO.API.Auth',
+        'version': '1',
+        'method': 'logout',
+        'session': 'DownloadStation'
+      }
+
+      if self._sid is not None:
+        query = self.make_query(getvars)
+        self._connection.request('GET', '/webapi/auth.cgi' + query)
+        response = self._connection.getresponse()
+        if response.status == 200:
+          data = json.loads(response.read())
+          if data['success']:
+            self._sid = None
+          else:
+            raise downloadstation.error_factory(data['error']['code'])
+        else:
+          raise downloadstation.BadStatus(response.status)
+
+      return self._sid == None
+    # logout
+
+
+    def tasks(self):
+      """Retrieve list of all tasks from Download Station api."""
+
+      tasks = None
+      postvars = urllib.urlencode({
+        'api': 'SYNO.DownloadStation.Task',
+        'version': '1',
+        'method': 'list',
+        'additional': 'detail,file',
+        '_sid': self._sid})
+
+      for retry in range(2):
+        try:
+          self._connection.request(
+            'POST', '/webapi/DownloadStation/task.cgi', postvars)
+          response = self._connection.getresponse()
+          if response.status == 200:
+            data = json.loads(response.read())
+            if data['success']:
+              tasks = []
+              for task in data['data']['tasks']:
+                tasks.append(downloadstation.Task(
+                  task['title'], task['additional']['detail']['destination']))
+            else:
+              raise downloadstation.error_factory(data['error']['code'])
+          else:
+            raise downloadstation.BadStatus(response.status)
+        except self._reconnect_on:
+          if retry:
+            raise
+          self._connection.close()
+          self._connection.connect()
+          continue
+
+        break # exit for-loop on success
+      # for
+
+      return tasks
+    # tasks
+
+# downloadstation
+
+
+class InfoFilter(logging.Filter):
+  def filter(self, rec):
+    return rec.levelno in (logging.DEBUG, logging.INFO)
+# InfoFilter
+
+
+class EventQueue(object):
+  """Simple queue implementation that notifies blocking threads on new items"""
+
+  class Empty(Exception):
+    pass
+
+  class Closed(Exception):
+    pass
+
+  _closed = False
+  _wait = False
+  _list = []
+
+  def __init__(self):
+    self._condition = threading.Condition()
+
+  def put(self, item):
+    self._condition.acquire()
+    self._list.append(item)
+    self._condition.notify()
+    self._condition.release()
+
+  def unget(self, item):
+    self._condition.acquire()
+    self._list.insert(0, item)
+    self._wait = True
+    self._condition.release()
+
+  def get(self, timeout=None):
+    self._condition.acquire()
+    item = None
+    closed = self._closed
+    if not closed:
+      if self._wait or len(self._list) == 0:
+        self._wait = False
+        self._condition.wait(timeout)
+        closed = self._closed
+        if not closed and len(self._list) != 0:
+          item = self._list.pop(0)
+      else:
+        item = self._list.pop(0)
+    self._condition.release()
+
+    if closed:
+      raise EventQueue.Closed()
+    elif item is None:
+      raise EventQueue.Empty()
+
+    return item
+
+  def close(self):
+    self._condition.acquire()
+    self._closed = True
+    self._condition.notify()
+    self._condition.release()
+
+# EventQueue
+
+
+class DSListener(smtpd.SMTPServer):
+  _pattern = re.compile(
+    '^Subject: \[Download Station\]  \S+ BT download task \((?P<filename>[^\n]+)\) is completed$', re.MULTILINE)
+
+  def __init__(self, host, port, queue, logger):
+    self._queue = queue
+    self._logger = logger
+
+    self._logger.info("Running SMTP server on %s port %d" % (host, port))
+    smtpd.SMTPServer.__init__(self, (host, port), None)
+
+  def process_message(self, peer, mailfrom, rcpttos, data):
+    match = self._pattern.search(data)
+    if match:
+      filename = match.group('filename')
+      self._logger.info("Received task '%s'" % (filename))
+      self._queue.put(filename)
+
+# DSListener
+
+
+class ArgumentFormatter(argparse.HelpFormatter):
+  def _format_action_invocation(self, action):
+    if not action.option_strings:
+      metavar, = self._metavar_formatter(action, action.dest)(1)
+      return metavar
+    else:
+      parts = []
+      # if the Optional doesn't take a value, format is:
+      #    -s, --long
+      if action.nargs == 0:
+        parts.extend(action.option_strings)
+
+      # if the Optional takes a value, format is:
+      #    -s ARGS, --long ARGS
+      # change to
+      #    -s, --long ARGS
+      else:
+        default = action.dest.upper()
+        args_string = self._format_args(action, default)
+        for option_string in action.option_strings:
+          #parts.append('%s %s' % (option_string, args_string))
+          parts.append('%s' % option_string)
+        parts[-1] += ' %s'%args_string
+      return ', '.join(parts)
+# ArgumentFormatter
+
+
+def volumes():
+  return [x for x in os.listdir('/') if re.match('^volume(?:USB)?\d+$', x)]
+
+def process_tasks(queue, logger, ds, script):
+  """Main routine of thread that will process task notifications"""
+
+  # note that it is not about the speed with which a single task is handled. it
+  # is all about handling Download Station notifications fast enough to not
+  # block its operation
+
+  sid = None
+  timeout = None # used for retries in case api fails
+  terminate = False
+
+  while not terminate:
+    failed = False
+
+    try:
+      title = queue.get(timeout)
+      logger.info("Task '%s'" % (title))
+
+      # process task
+      retry = True
+      tasks = None
+      failed = True
+      timeout = None
+      while tasks is None and retry:
+        try:
+          if not sid:
+            sid = ds.login()
+          tasks = ds.tasks()
+        except (downloadstation.APIError) as e:
+          if ((e.code == 105 or e.code == 106) and sid) or (e.code == 107):
+            sid = None
+          else:
+            logger.warning("Failed to process '%s', %s" % (title, e.message))
+            retry = False
+            timeout = 300.0 # five minutes
+        except httplib.HTTPException as e:
+          logger.warning("Failed to process '%s', %s" % (title, e.message))
+          retry = False
+          timeout = 300.0 # five minutes
+        break
+      # while
+
+      task = None
+      if tasks:
+        logger.debug("Retrieved task list from Download Station api")
+        failed = False # no sense in keeping it around
+        for item in tasks:
+          if item.title == title:
+            task = item
+        if not task:
+          logger.warning("Failed to process '%s', does not occur in task list"
+                           % (title))
+      # if
+
+      if task:
+        # mount point on which destination directory resides is not returned by
+        # Download Station api, so every volume must be checked
+        directory = None
+        for volume in volumes():
+          path = '/%s/%s/%s' % (volume, task.destination, task.title)
+          if os.path.exists(path):
+            directory = '/%s/%s' % (volume, task.destination)
+        # for
+
+        if directory:
+          logger.debug("Fully qualified path for task '%s' is %s/%s"
+                        % (title, directory, title))
+          envvars = os.environ.copy()
+          envvars['DS_TASK_TITLE'] = title
+          envvars['DS_TASK_DESTINATION'] = directory
+
+          try:
+            exit_code = subprocess.call(script, env=envvars)
+            if exit_code != os.EX_OK:
+              logger.warning("Failed to process '%s', script '%s' exited with %d"
+                               % (title, script, exit_code))
+            else:
+              logger.debug("Script '%s' exited with %d for task '%s'"
+                             % (script, exit_code, title))
+          except (OSError) as e:
+            logger.error("Failed to execute '%s' for '%s', %s"
+                           % (script, title, e.strerror))
+
+        else:
+          logger.warning("Failed to process '%s', destination does not exist"
+                          % (title))
+    except EventQueue.Empty:
+      logger.debug("Spurious wakeup")
+    except EventQueue.Closed:
+      # queue is closed indicating there is nothing left to do
+      logger.debug("Queue closed")
+      terminate = True
+
+    if failed:
+      queue.unget(title)
+  # while
+
+  ds.logout()
+# process_tasks
+
+
+def main():
+  # parse command line arguments
+  parser = argparse.ArgumentParser(
+    prog='dsnotify', formatter_class=ArgumentFormatter)
+  parser.add_argument('-d', '--debug',
+    help='enable debug messages',
+    action='store_true',
+    default=False)
+  parser.add_argument('-s', '--script',
+    help='script to execute for each completed task',
+    required=True)
+  parser.add_argument('--host',
+    help='hostname or address Download Station listens on',
+    default='localhost',
+    metavar='HOST')
+  parser.add_argument('--port',
+    help='port number Download Station listens on',
+    default=5000,
+    type=int,
+    metavar='PORT')
+  parser.add_argument('--use-https',
+    help='connect to Download Station using HTTPS',
+    action='store_true',
+    default=False)
+  parser.add_argument('-u', '--user',
+    help='username of Download Station user',
+    required=True,
+    metavar='USER')
+  parser.add_argument('-p', '--password',
+    help='Download Station password',
+    required=True,
+    metavar='PWD')
+  parser.add_argument('--timeout',
+    help='number of seconds to wait for response',
+    default=10,
+    type=int,
+    metavar='TIMEOUT')
+  parser.add_argument('--smtp-address',
+    help='address to bind on for incoming messages',
+    default='127.0.0.1',
+    metavar='HOST')
+  parser.add_argument('--smtp-port',
+    help='port number to listen on for incoming messages',
+    default=2525,
+    type=int,
+    metavar='PORT')
+  parser.add_argument('--pid-file',
+    help='location of PID file',
+    default='dsnotify.pid',
+    metavar='PATH',
+    dest='pidfile')
+  parser.add_argument('--daemonize',
+    help='fork into background',
+    action='store_true',
+    default=False)
+
+  # FIXME: support specifying user and group for dropping privileges
+
+  args = parser.parse_args()
+
+  handlers = [None, None, None] # syslog, stdout, stderr
+  level = logging.INFO
+  if args.debug:
+    level = logging.DEBUG
+
+  logger = logging.getLogger('dsnotify')
+  logger.setLevel(level)
+
+  formatter = logging.Formatter('%(name)s: %(message)s')
+  syslog = logging.handlers.SysLogHandler(address='/dev/log')
+  syslog.setLevel(level)
+
+  formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+  stdout = logging.StreamHandler(sys.stdout)
+  # add filter to ensure stdout only shows debug and info messages
+  # see http://stackoverflow.com/a/16066513 for details
+  stdout.setLevel(level)
+  stdout.setFormatter(formatter)
+  stdout.addFilter(InfoFilter())
+  stderr = logging.StreamHandler(sys.stderr)
+  stderr.setLevel(logging.WARNING)
+  stderr.setFormatter(formatter)
+
+  logger.addHandler(syslog)
+  logger.addHandler(stdout)
+  logger.addHandler(stderr)
+
+  if args.daemonize:
+    pid = None
+    try:
+      file = open(args.pidfile,'r')
+      pid = int(file.read().strip())
+      file.close()
+      if pid:
+        os.kill(pid, 0)
+    except (IOError) as e:
+      if e.errno == errno.EACCES:
+        logger.error("Failed to read '%s', %s" % (args.pidfile, e.strerror))
+        return 1
+    except (OSError) as e:
+      if e.errno == errno.ESRCH:
+        pid = None
+
+    if pid:
+      logger.error("Already running with pid %d" % (pid))
+      return 0
+
+    # first fork
+    try:
+      pid = os.fork()
+      if pid > 0:
+        # exit first parent
+        return 0
+    except OSError as e:
+      logger.error("Fork #1 failed, %s" % (e.strerror))
+      return 1
+
+    # decouple from parent environment
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+
+    # second fork
+    try:
+      pid = os.fork()
+      if pid > 0:
+        # exit second parent
+        return 0
+    except OSError as e:
+      logger.error("Fork #2 failed, %s" % (e.strerror))
+      return 1
+
+    logger.removeHandler(stdout)
+    logger.removeHandler(stderr)
+
+    # redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    devnull = open('/dev/null', 'w+')
+    os.dup2(devnull.fileno(), sys.stdin.fileno())
+    os.dup2(devnull.fileno(), sys.stdout.fileno())
+    os.dup2(devnull.fileno(), sys.stderr.fileno())
+
+    # write pid to disk
+    try:
+      file = open(args.pidfile, 'w')
+      file.write("%d\n" % (os.getpid()))
+      file.close()
+    except (IOError) as e:
+      logger.warning("Failed to write pidfile '%s', %s"
+                       % (args.pidfile, e.strerror))
+
+    # FIXME: drop privileges
+  else:
+    pass
+
+  # FIXME: create a signal handler (catch sigint and sigterm)
+
+  queue = EventQueue()
+
+  # instantiate Download Station api
+  ds = downloadstation.DownloadStation(
+    host=args.host,
+    port=args.port,
+    username=args.user,
+    password=args.password,
+    use_https=args.use_https,
+    timeout=args.timeout)
+
+  worker = threading.Thread(
+    target=process_tasks, args=(queue, logger, ds, args.script))
+  worker.start()
+
+  listener = DSListener(args.smtp_address, args.smtp_port, queue, logger)
+  try:
+    asyncore.loop()
+  except KeyboardInterrupt:
+    queue.close()
+
+  worker.join() # wait for worker to finish
+
+  return 0
+
+# main
+
+if __name__ == '__main__':
+  sys.exit(main())
+
