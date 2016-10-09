@@ -551,7 +551,7 @@ def main():
   password = None
   try:
     file = open(args.password_file)
-    password = file.read()
+    password = file.read().strip()
     file.close()
   except (IOError) as e:
     logger.error("Failed to read password from '%s', %s"
