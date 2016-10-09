@@ -467,13 +467,13 @@ def main():
     action='store_true',
     default=False)
   parser.add_argument('-u', '--user',
-    help='username of Download Station user',
+    help='username to use for Download Station API',
     required=True,
     metavar='USER')
-  parser.add_argument('-p', '--password',
-    help='Download Station password',
+  parser.add_argument('-p', '--password-file',
+    help='file to Download Station API password from',
     required=True,
-    metavar='PWD')
+    metavar='PATH')
   parser.add_argument('--timeout',
     help='number of seconds to wait for response',
     default=10,
@@ -528,6 +528,16 @@ def main():
   logger.addHandler(syslog)
   logger.addHandler(stdout)
   logger.addHandler(stderr)
+
+  password = None
+  try:
+    file = open(args.password_file)
+    password = file.read()
+    file.close()
+  except (IOError) as e:
+    logger.error("Failed to read password from '%s', %s"
+                   % (args.password_file, e.strerror))
+    return 1
 
   if args.daemonize:
     pid = None
@@ -608,7 +618,7 @@ def main():
     host=args.host,
     port=args.port,
     username=args.user,
-    password=args.password,
+    password=password,
     use_https=args.use_https,
     timeout=args.timeout)
 
