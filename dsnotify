@@ -13,6 +13,7 @@ import logging
 import logging.handlers
 import os
 import re
+import signal
 import smtpd
 import subprocess
 import sys
@@ -437,6 +438,10 @@ def process_tasks(queue, logger, ds, script):
 # process_tasks
 
 
+def signal_handler(signum, frame):
+  raise asyncore.ExitNow
+
+
 def main():
   # parse command line arguments
   parser = argparse.ArgumentParser(
@@ -593,7 +598,8 @@ def main():
   else:
     pass
 
-  # FIXME: create a signal handler (catch sigint and sigterm)
+  # register signal handler to terminate gracefully
+  signal.signal(signal.SIGTERM, signal_handler)
 
   queue = EventQueue()
 
@@ -613,7 +619,8 @@ def main():
   listener = DSListener(args.smtp_address, args.smtp_port, queue, logger)
   try:
     asyncore.loop()
-  except KeyboardInterrupt:
+  except (KeyboardInterrupt, asyncore.ExitNow):
+    logger.info("Terminating")
     queue.close()
 
   worker.join() # wait for worker to finish
