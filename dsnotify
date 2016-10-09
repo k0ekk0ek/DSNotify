@@ -491,16 +491,35 @@ def main():
   parser.add_argument('--pid-file',
     help='location of PID file',
     default='dsnotify.pid',
-    metavar='PATH',
-    dest='pidfile')
+    metavar='PATH')
   parser.add_argument('--daemonize',
     help='fork into background',
     action='store_true',
     default=False)
 
-  # FIXME: support specifying user and group for dropping privileges
+  # FIXME: support specifying user and group for dropping privileges?
 
   args = parser.parse_args()
+
+  # ensure pid file location is specified if daemonize is requested
+  if args.daemonize and not args.pid_file:
+    parser.print_usage()
+    return 1
+
+  # ensure required attributes have values
+  attrs = [
+    'script',
+    'host',
+    'port',
+    'user',
+    'password_file',
+    'smtp_address',
+    'smtp_port']
+
+  for attr in attrs:
+    if not getattr(args, attr, None):
+      parser.print_usage()
+      return 1
 
   handlers = [None, None, None] # syslog, stdout, stderr
   level = logging.INFO
@@ -542,14 +561,14 @@ def main():
   if args.daemonize:
     pid = None
     try:
-      file = open(args.pidfile,'r')
+      file = open(args.pid_file,'r')
       pid = int(file.read().strip())
       file.close()
       if pid:
         os.kill(pid, 0)
     except (IOError) as e:
       if e.errno == errno.EACCES:
-        logger.error("Failed to read '%s', %s" % (args.pidfile, e.strerror))
+        logger.error("Failed to read '%s', %s" % (args.pid_file, e.strerror))
         return 1
     except (OSError) as e:
       if e.errno == errno.ESRCH:
@@ -597,14 +616,12 @@ def main():
 
     # write pid to disk
     try:
-      file = open(args.pidfile, 'w')
+      file = open(args.pid_file, 'w')
       file.write("%d\n" % (os.getpid()))
       file.close()
     except (IOError) as e:
       logger.warning("Failed to write pidfile '%s', %s"
                        % (args.pidfile, e.strerror))
-
-    # FIXME: drop privileges
   else:
     pass
 
