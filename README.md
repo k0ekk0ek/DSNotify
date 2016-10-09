@@ -4,17 +4,25 @@ DSNotify implements a simple Python SMTP server to handle email notifications (a
 
 Installation
 ------------
-1. Copy `dsnotify` to `/usr/local/sbin` on the Synology NAS
+1. Copy `dsnotify` to `/usr/local/bin/dsnotify`
 
-2. Create a Cron job to start the serice at boot time by editing `/etc/cronjobs` and adding the following content.
-```
-#minute hour    mday    month   wday    who     command
-@reboot                                 root    /usr/local/bin/dsnotify -s SCRIPT -u USER -p PASSWORD
-```
+2. Change `dsnotify` mode to `0755`
 
-> DSNotify supports a number of other options too, run dsnotify -h for details
+3. Copy `dsnotify.sh` to `/usr/local/etc/rc.d/dsnotify.sh`, to ensure the service is started at boot time (only files with the .sh extension are executed)
 
-> Cron job *who* column must contain *root*, but you can drop privileges before executing the script by passing the command through */bin/su -c "/path/to/command" user*
+4. Change `dsnotify.sh` mode to `0755` (only files with mode *0755* are executed)
+
+5. Copy `dsnotify.conf` to `/usr/local/etc/dsnotify/dsnotify.conf`
+
+6. Create `/usr/local/etc/dsnotify/dsnotify.passwd` and place
+
+7. Change `dsnotify.passwd` mode to `0400`
+
+8. Update configuration settings in `dsnotify.conf` to suit your environment
+
+9. Start DSNotify by executing `/usr/local/etc/rc.d/dsnotify.sh start`
+
+> DSNotify supports a number of other options too, run dsnotify -h for details. Update `dsnotify.sh` and `dsnotify.conf` accordingly to make DSNotify use your preferences on startup.
 
 E-mail notifications
 --------------------
